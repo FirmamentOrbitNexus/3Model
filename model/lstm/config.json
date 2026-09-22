@@ -1,0 +1,18 @@
+{
+  "model": "StockLSTM",
+  "lookback": 60,
+  "pred_window": 5,
+  "input_dim": 13,
+  "output_dim": 6,
+  "hidden_dim": 256,
+  "num_layers": 2,
+  "dropout": 0.2,
+  "seed": 42,
+  "batch_size": 256,
+  "epochs": 50,
+  "lr": 0.001,
+  "num_workers": 4,
+  "use_tf32": false,
+  "train_start": "",
+  "train_end": "2026-08-14"
+}

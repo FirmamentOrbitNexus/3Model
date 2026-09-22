@@ -1,0 +1,18 @@
+# 依赖清单（Python 3.10 / CUDA 11.7）
+# 安装: pip install -r requirements.txt
+
+# 深度学习框架（Kronos / LSTM / Transformer）
+torch==2.0.1
+
+# 数值计算（注意: numpy 2.x 与 torch 2.0.1 不兼容，锁定 1.x）
+numpy>=1.23,<2.0
+pandas>=1.5,<3.0
+tqdm
+
+# Kronos 模型依赖
+einops
+huggingface_hub
+safetensors
+
+# LightGBM 表格基线
+lightgbm>=4.0

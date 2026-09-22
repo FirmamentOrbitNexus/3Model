@@ -1,0 +1,69 @@
+# ============================
+# Python
+# ============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+.installed.cfg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+.python-version
+
+# ============================
+# IDE / 编辑器
+# ============================
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ============================
+# 日志与缓存
+# ============================
+*.log
+*.tmp
+*.bak
+
+# ============================
+# 大文件 / 训练中间产物
+# ============================
+# 训练脚本会自动重新生成
+data/finetune_samples_v6.pkl
+data/samples_*.pkl
+
+# ============================
+# 大权重文件（超过 GitHub 100MB 限制）
+# 建议通过网盘/Hugging Face 提供下载链接
+# ============================
+pretrained/*/*.safetensors
+model/*/*/*.safetensors
+
+# ============================
+# 原始数据（可选保留，体积较大）
+# 如需提交可注释掉下一行
+# ============================
+data/stock_data.csv
+
+# ============================
+# 输出与临时目录（保留目录但忽略内容）
+# ============================
+output/*/*
+!output/*/.gitkeep
+output/*/*/*
+!output/*/*/.gitkeep
+temp/*
+!temp/.gitkeep
