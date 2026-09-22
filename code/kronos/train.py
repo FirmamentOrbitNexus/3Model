@@ -202,6 +202,9 @@ class Config:
     # DataLoader 工作进程数（默认 0：Kronos 样本为 DataFrame 结构，
     # 多进程在 Windows 下会重复反序列化整个数据集，显存/内存代价高）
     num_workers = int(os.environ.get('KRONOS_NUM_WORKERS', '0'))
+    # 训练数据截止日（环境变量 TRAIN_END_DATE 可覆盖）
+    # 与 test.py 的首个预测基准日保持一致，避免测试期数据泄露进训练集
+    train_end_date = '2026-08-14'
 
 
 cfg = Config()
@@ -382,6 +385,11 @@ def main():
     ts = timestamp()
     logger = setup_logger('kronos', ts)
     logger.info("Kronos 微调训练流程开始")
+
+    # 训练数据截止日（写入环境变量，供 generate_finetune_data 做时间划分，避免泄露测试期）
+    os.environ.setdefault('TRAIN_END_DATE', cfg.train_end_date)
+    if os.environ.get('TRAIN_END_DATE'):
+        logger.info(f"训练数据截止日: {os.environ['TRAIN_END_DATE']}")
 
     # 第一步：生成训练数据
     data_file = generate_finetune_data()

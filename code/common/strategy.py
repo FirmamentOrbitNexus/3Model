@@ -1,71 +1,55 @@
 # ============================================================
 # strategy.py - 选股策略与推理结果持久化（各模型 test.py 共用）
-# 单点维护，避免三池选股逻辑在多个 test.py 中重复实现
+# 单点维护，避免选股逻辑在多个 test.py 中重复实现
 # 纯 pandas/numpy 实现，不依赖 torch
 # ============================================================
 
 import os
 
-import numpy as np
 import pandas as pd
+
+# ==================== 选股参数（可调） ====================
+# 组合持股数上限（赛题约束 ≤5），环境变量 TOP_K 可覆盖
+TOP_K = int(os.environ.get('TOP_K', '5'))
+# 入选所需的最低预期收益（默认 0.0 = 只买预期上涨的股票；
+# 设为负值可放宽，如 -0.01 允许小幅负收益标的入选）
+MIN_ROI = float(os.environ.get('MIN_ROI', '0.0'))
 
 # 各模型输出目录下的通用文件名
 FULL_FILE_NAME = 'result_full.csv'
 PORTFOLIO_FILE_NAME = 'result_portfolio.csv'
 
 
-# ==================== 三池选股 ====================
-def select_portfolio(result_df: pd.DataFrame):
+# ==================== Top-K 等权选股 ====================
+def select_portfolio(result_df: pd.DataFrame, top_k: int = None, min_roi: float = None):
     """
-    三池选股策略（与 Kronos test.py 口径一致，最多 3 只股票）：
-      1) 超高收益池 roi>0.10：取距离池均值最近的 1 只，权重 0.4
-      2) 高收益池   0.05<roi<0.10：过滤 |roi-均值|≤0.01，取距过滤后均值最近 1 只，权重 0.3
-      3) 负收益池   -0.02<roi<0：从 |roi|∈[0.01,0.018] 中选 V+roi>0 且最接近 0 的 1 只，权重 0.3
-        其中 V = (超高池 roi × 0.4 + 高收益池 roi × 0.3) / 5
-    总权重 0.4+0.3+0.3 = 1.0；某池无满足条件时输出条目不足 3 只（满足"最多不超过 5 只"约束）
+    Top-K 等权选股（四模型统一口径）：
+      1) 过滤 expected_roi >= min_roi（默认 0.0，即只买预期上涨的股票，避免买入预测下跌标的）
+      2) 按 expected_roi 降序取前 top_k 只（默认 5，满足"最多不超过 5 只"约束）
+      3) 等权 1/n 分配（n = 实际入选数，权重和恒为 1.0，尽量满仓）
+    候选不足时按实际数量输出，不补位到不存在的标的。
 
     result_df 需含列: code, expected_roi
     返回 [{stock_id, weight}, ...]
     """
-    pool_super = result_df[result_df['expected_roi'] > 0.10].copy()
-    pool_high = result_df[(result_df['expected_roi'] > 0.05) & (result_df['expected_roi'] < 0.10)].copy()
-    pool_neg = result_df[(result_df['expected_roi'] > -0.02) & (result_df['expected_roi'] < 0)].copy()
+    k = TOP_K if top_k is None else int(top_k)
+    floor = MIN_ROI if min_roi is None else float(min_roi)
 
-    final_super = final_high = final_neg = None
+    if result_df is None or result_df.empty:
+        return []
+    if 'expected_roi' not in result_df.columns:
+        raise KeyError("result_df 缺少 expected_roi 列")
 
-    # 1) 超高收益池：距离池均值最近的 1 只
-    if len(pool_super) > 0:
-        m = pool_super['expected_roi'].mean()
-        pool_super['abs_to_mean'] = np.abs(pool_super['expected_roi'] - m)
-        final_super = pool_super.loc[pool_super['abs_to_mean'].idxmin()]
+    cand = result_df[result_df['expected_roi'] >= floor]
+    if cand.empty:
+        return []
 
-    # 2) 高收益池：过滤后取距离过滤均值最近的 1 只
-    if len(pool_high) > 0:
-        m_raw = pool_high['expected_roi'].mean()
-        filt = pool_high[np.abs(pool_high['expected_roi'] - m_raw) <= 0.01].copy()
-        if len(filt) > 0:
-            m = filt['expected_roi'].mean()
-            filt['abs_to_mean'] = np.abs(filt['expected_roi'] - m)
-            final_high = filt.loc[filt['abs_to_mean'].idxmin()]
-
-    # 3) 负收益对冲池
-    if final_super is not None and final_high is not None and len(pool_neg) > 0:
-        V = (final_super['expected_roi'] * 0.4 + final_high['expected_roi'] * 0.3) / 5.0
-        c = pool_neg.copy()
-        c = c[(np.abs(c['expected_roi']) >= 0.01) & (np.abs(c['expected_roi']) <= 0.018)].copy()
-        c['sum_val'] = V + c['expected_roi']
-        c = c[c['sum_val'] > 0].sort_values('sum_val', ascending=True)
-        if len(c) > 0:
-            final_neg = c.iloc[0]
-
-    rows = []
-    if final_super is not None:
-        rows.append({'stock_id': final_super['code'], 'weight': 0.4})
-    if final_high is not None:
-        rows.append({'stock_id': final_high['code'], 'weight': 0.3})
-    if final_neg is not None:
-        rows.append({'stock_id': final_neg['code'], 'weight': 0.3})
-    return rows
+    # 降序取前 K 只；code 作为次级排序键，保证并列时结果稳定可复现
+    top = cand.sort_values(['expected_roi', 'code'],
+                           ascending=[False, True]).head(max(k, 1))
+    n = len(top)
+    weight = 1.0 / n
+    return [{'stock_id': row['code'], 'weight': weight} for _, row in top.iterrows()]
 
 
 # ==================== 推理结果持久化 ====================

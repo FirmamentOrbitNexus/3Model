@@ -1,9 +1,9 @@
 # ============================================================
-# test.py - LightGBM 基线推理 + 沪深300 选股
+# test.py - LightGBM 基线推理 + 沪深300 选股（多期滚动）
 # 输出与 LSTM/Transformer/Kronos 的 test.py 完全同构：
-#   result.csv（竞赛格式）、result_full.csv、result_portfolio.csv
+#   result_<日期>.csv（单期明细）、result_full.csv、result_portfolio.csv
 #   （后两者按 pred_date 累积去重，供 common/evaluate.py 统一评估）
-# 支持 END_DATE / MODEL_DIR / OUTPUT_DIR 等环境变量覆盖
+# 支持 END_DATES / MODEL_DIR / OUTPUT_DIR 等环境变量覆盖
 # ============================================================
 import os
 
@@ -25,9 +25,11 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.config import SEED
 from common.data_io import load_stock_dataframe, load_trade_calendar, align_stock_calendar
-from common.featurework import compute_features, MODEL_COLUMNS, FEATURE_COLUMNS
+from common.featurework import compute_features, MODEL_COLUMNS
 from common.paths import model_dir, output_dir
-from common.strategy import select_portfolio, save_full_predictions, save_portfolio
+from common.strategy import (
+    TOP_K, select_portfolio, save_full_predictions, save_portfolio,
+)
 
 random.seed(SEED)
 np.random.seed(SEED)
@@ -46,10 +48,15 @@ HORIZON = DEFAULT_HORIZON
 
 MODEL_DIR = model_dir('lgbm')      # 环境变量 MODEL_DIR 可覆盖
 OUTPUT_DIR = output_dir('lgbm')    # 环境变量 OUTPUT_DIR 可覆盖
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'result.csv')
 
-END_DATE = os.environ.get('END_DATE', '2026-07-31')
-PRED_DATE = END_DATE
+# 预测基准日列表（环境变量 END_DATES 逗号分隔可覆盖）
+# 每个基准日预测其后 5 个交易日，三期滚动预测：
+#   2026-08-14（周五）-> 08-17 ~ 08-21
+#   2026-08-21（周五）-> 08-24 ~ 08-28
+#   2026-08-28（周五）-> 08-31 ~ 09-04
+END_DATES = [d.strip() for d in
+             os.environ.get('END_DATES', '2026-08-14,2026-08-21,2026-08-28').split(',')
+             if d.strip()]
 
 _booster = None
 
@@ -86,46 +93,73 @@ def build_feature(stock: pd.DataFrame, lookback: int):
     return np.nan_to_num(x, nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float32)
 
 
-# ==================== 主流程 ====================
-def main():
-    logger.info("LightGBM 推理 + 沪深300 选股流程开始")
-    df = load_stock_dataframe()
-    df = df[df['timestamps'] <= pd.to_datetime(END_DATE)]
-    trade_dates = load_trade_calendar()
-    booster = load_model()
-
-    results = []
-    for code in sorted(df['code'].unique()):
+# ==================== 单期截面预测 ====================
+def predict_cross_section(booster, df_all: pd.DataFrame, end_date: str,
+                          trade_dates, lookback: int):
+    """
+    在某个基准日对全市场做截面预测（LightGBM 直接输出 expected_roi）
+    returns: (result_df, 候选股票数, 异常股票数)
+    """
+    df = df_all[df_all['timestamps'] <= pd.to_datetime(end_date)]
+    stock_codes = sorted(df['code'].unique())
+    results, errors = [], 0
+    for code in stock_codes:
         try:
             stock = df[df['code'] == code].copy().set_index('timestamps')
             stock = align_stock_calendar(stock, trade_dates).reset_index()
-            x = build_feature(stock, LOOKBACK)
+            x = build_feature(stock, lookback)
             if x is None:
                 continue
             roi = float(booster.predict(x.reshape(1, -1))[0])
             results.append({'code': code, 'expected_roi': roi})
         except Exception as e:
-            logger.debug(f"股票 {code} 预测失败: {e}")
+            errors += 1
+            if errors <= 3:               # 只打印前 3 条，避免刷屏
+                logger.warning(f"股票 {code} 预测失败: {e}")
             continue
 
     result_df = pd.DataFrame(results)
-    if result_df.empty:
-        logger.warning("无有效预测结果")
-        return
-    result_df['rank'] = result_df['expected_roi'].rank(method='first', ascending=False).astype(int)
+    if not result_df.empty:
+        result_df['rank'] = result_df['expected_roi'].rank(method='first', ascending=False).astype(int)
+    return result_df, len(stock_codes), errors
 
-    save_full_predictions(result_df, OUTPUT_DIR, PRED_DATE, logger)
 
-    select_rows = select_portfolio(result_df)
-    if len(select_rows) != 3:
-        logger.warning(f"部分池子无满足筛选条件的股票，输出 {len(select_rows)} 只（约束≤5）")
-    save_portfolio(select_rows, OUTPUT_DIR, PRED_DATE, logger)
+# ==================== 主流程 ====================
+def main():
+    logger.info("LightGBM 推理 + 沪深300 选股流程开始")
+    logger.info(f"预测基准日 {len(END_DATES)} 期: {', '.join(END_DATES)}（每期预测其后 5 个交易日）")
 
-    out_df = pd.DataFrame(select_rows)
+    df_all = load_stock_dataframe()
+    trade_dates = load_trade_calendar()
+    booster = load_model()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_df.to_csv(OUTPUT_FILE, index=False)
-    logger.info(f"结果已保存: {OUTPUT_FILE}")
-    print(out_df.to_string(index=False))
+
+    for end_date in END_DATES:
+        result_df, n_codes, n_err = predict_cross_section(
+            booster, df_all, end_date, trade_dates, LOOKBACK)
+        if result_df.empty:
+            logger.warning(f"[{end_date}] 无有效预测结果（候选 {n_codes} 只，异常 {n_err} 只）")
+            continue
+        logger.info(f"[{end_date}] 候选 {n_codes} 只，有效预测 {len(result_df)} 只，异常 {n_err} 只")
+
+        # 累积保存（按 pred_date 分组，供 evaluate.py 统一评估）
+        save_full_predictions(result_df, OUTPUT_DIR, end_date, logger)
+
+        select_rows = select_portfolio(result_df)
+        if len(select_rows) < TOP_K:
+            logger.warning(f"[{end_date}] 候选不足，仅选出 {len(select_rows)} 只（上限 {TOP_K}）")
+        save_portfolio(select_rows, OUTPUT_DIR, end_date, logger)
+
+        # 单期明细（按基准日命名，便于逐期查看）
+        out_df = pd.DataFrame(select_rows)
+        period_file = os.path.join(OUTPUT_DIR, f"result_{end_date.replace('-', '')}.csv")
+        out_df.to_csv(period_file, index=False)
+        logger.info(f"[{end_date}] 结果已保存: {period_file}")
+
+        print(f"\n===== 基准日 {end_date}（预测其后 5 个交易日）=====")
+        print(out_df.to_string(index=False) if len(out_df) else "（无满足条件的股票）")
+
+    logger.info("LightGBM 推理 + 选股流程结束")
 
 
 if __name__ == "__main__":

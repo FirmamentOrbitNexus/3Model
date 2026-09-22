@@ -26,7 +26,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from featurework import Kronos, KronosTokenizer, KronosPredictor
 from safetensors.torch import load_file
 from common.config import configure_determinism, get_device
+from common.data_io import load_trade_calendar
 from common.paths import STOCK_CSV, HS300_CSV, model_dir, output_dir
+from common.strategy import (
+    TOP_K, select_portfolio, save_full_predictions, save_portfolio,
+)
 
 # ---------- 统一随机种子 & 确定性配置 ----------
 configure_determinism()
@@ -46,26 +50,22 @@ TOKENIZER_DIR = os.environ.get('TOKENIZER_DIR', os.path.join(model_dir('kronos')
 MODEL_DIR = os.environ.get('MODEL_DIR', os.path.join(model_dir('kronos'), 'predictor'))
 # 预测结果输出目录（位于 output/kronos/ 下）
 OUTPUT_DIR = output_dir('kronos')
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, 'result.csv')
-# 全量预测 / 组合累积文件（滚动评估用，按 pred_date 累积去重）
-FULL_FILE = os.path.join(OUTPUT_DIR, 'result_full.csv')
-PORTFOLIO_FILE = os.path.join(OUTPUT_DIR, 'result_portfolio.csv')
 
-# 预测目标日期（可由环境变量 PRED_DATES 覆盖）
-PRED_DATES = os.environ.get('PRED_DATES', '2026-08-03,2026-08-04,2026-08-05,2026-08-06,2026-08-07')
-PRED_DATES = PRED_DATES.split(',')
-# 数据截止日期（可由环境变量 END_DATE 覆盖）
-END_DATE = os.environ.get('END_DATE', '2026-07-31')
-# 本次预测基准日期（评估分组键）
-PRED_DATE = END_DATE
+# 预测基准日列表（环境变量 END_DATES 逗号分隔可覆盖）
+# 每个基准日预测其后 5 个交易日的开盘价，具体目标日期由交易日历推算（见 next_trade_dates）
+#   2026-08-14（周五）-> 08-17 ~ 08-21
+#   2026-08-21（周五）-> 08-24 ~ 08-28
+#   2026-08-28（周五）-> 08-31 ~ 09-04
+END_DATES = [d.strip() for d in
+             os.environ.get('END_DATES', '2026-08-14,2026-08-21,2026-08-28').split(',')
+             if d.strip()]
 
 '''
-选股逻辑：
-1. 按expected_roi降序排序
-2. 超高收益池 roi>0.10，取距离池子均值最近1只，权重0.4
-3. 高收益池 0.05<roi<0.10，过滤|roi‑池均值|≤0.01，取距离过滤后均值最近1只，权重0.3
-4. 负收益池过滤：计算V=(super_roi*0.4+high_roi*0.3)/5；筛选V+roi_neg>0，取sum_val最靠近0的标的，权重0.3
-总权重 0.4+0.3+0.3 =1.0
+选股逻辑（与其余三模型统一，实现在 common/strategy.py::select_portfolio）：
+1. 过滤 expected_roi >= MIN_ROI（默认 0.0，只买预期上涨的股票）
+2. 按 expected_roi 降序取前 TOP_K 只（默认 5，满足"最多不超过 5 只"约束）
+3. 等权 1/n 分配（n = 实际入选数，权重和恒为 1.0，尽量满仓）
+另：result_full.csv / result_portfolio.csv 由 common/strategy.py 统一维护
 '''
 
 # 训练设备（GPU 或 CPU）
@@ -136,54 +136,24 @@ def winsorize_x_df(x_df):
     x_np = np.clip(x_np, mean-3*std, mean+3*std)
     return pd.DataFrame(x_np, columns=x_df.columns)
 
-def save_full_predictions(result_df):
-    """保存全部股票的预测结果，按 pred_date 累积去重，供 evaluate.py 统一评估"""
-    full_df = result_df[['code', 'T+1_open', 'T+5_open', 'expected_roi', 'rank']].copy()
-    full_df['code'] = full_df['code'].astype(str).str.zfill(6)
-    full_df.insert(0, 'pred_date', PRED_DATE)
-    if os.path.exists(FULL_FILE):
-        old = pd.read_csv(FULL_FILE, dtype=str)
-        old = old[old['pred_date'] != PRED_DATE]
-        full_df = pd.concat([old, full_df], ignore_index=True)
-    full_df = full_df.sort_values(['pred_date', 'rank']).reset_index(drop=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    full_df.to_csv(FULL_FILE, index=False)
-    print(f"全量预测已保存: {FULL_FILE} (共 {len(full_df)} 行)")
+def next_trade_dates(trade_dates, end_date: str, n: int):
+    """返回基准日 end_date 之后的 n 个交易日（作为 Kronos 的 y_timestamp）"""
+    after = trade_dates[trade_dates > pd.to_datetime(end_date)]
+    return after[:n]
 
 
-def save_portfolio(select_rows):
-    """保存组合选择结果（含 pred_date，累积），供 evaluate.py 组合回测"""
-    if not select_rows:
-        return
-    port_df = pd.DataFrame(select_rows)
-    port_df['stock_id'] = port_df['stock_id'].astype(str).str.zfill(6)
-    port_df.insert(0, 'pred_date', PRED_DATE)
-    if os.path.exists(PORTFOLIO_FILE):
-        old = pd.read_csv(PORTFOLIO_FILE, dtype=str)
-        old = old[old['pred_date'] != PRED_DATE]
-        port_df = pd.concat([old, port_df], ignore_index=True)
-    port_df = port_df.sort_values(['pred_date', 'weight'], ascending=[True, False]).reset_index(drop=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    port_df.to_csv(PORTFOLIO_FILE, index=False)
-    print(f"组合记录已保存: {PORTFOLIO_FILE}")
-
-
-def main():
-    """主函数：数据加载 -> 模型预测 -> 选股 -> 输出结果"""
-    # 加载并清洗数据
-    df_all = preprocess_data()
-    # 过滤到截止日期之前的数据
-    df_all = df_all[df_all['timestamps'] <= pd.to_datetime(END_DATE)]
-    # 获取所有股票代码并排序
-    stock_codes = sorted(df_all['code'].unique())
-
-    # 加载模型
-    load_model()
-    results = []
-    # 遍历每只股票进行预测
-    for code in tqdm(stock_codes, desc="预测"):
+def predict_cross_section(predictor, df_all: pd.DataFrame, end_date: str, pred_dates):
+    """
+    在某个基准日对全市场做截面预测
+    returns: (result_df, 候选股票数, 异常股票数)
+    """
+    df = df_all[df_all['timestamps'] <= pd.to_datetime(end_date)]
+    stock_codes = sorted(df['code'].unique())
+    y_ts = pd.to_datetime(list(pred_dates)).to_series()
+    results, errors = [], 0
+    for code in tqdm(stock_codes, desc=f"预测 {end_date}"):
         try:
-            stock = df_all[df_all['code']==code].copy()
+            stock = df[df['code'] == code].copy()
             # 数据不足则跳过
             if len(stock) < LOOKBACK:
                 continue
@@ -193,10 +163,9 @@ def main():
             # 缩尾处理
             x_df = winsorize_x_df(x_df)
             x_ts = stock['timestamps'].iloc[-lb:].reset_index(drop=True)
-            y_ts = pd.to_datetime(PRED_DATES).to_series()
 
             # 模型预测
-            p = _predictor.predict(
+            p = predictor.predict(
                 df=x_df,
                 x_timestamp=x_ts,
                 y_timestamp=y_ts,
@@ -208,98 +177,59 @@ def main():
             )
             pred_mean = p[['open','high','low','close','volume','amount']].values
             # 保存预测结果：T+1 和 T+5 的开盘价
-            results.append({'code':code,'T+1_open':pred_mean[0,0],'T+5_open':pred_mean[4,0]})
-        except Exception:
+            results.append({'code': code, 'T+1_open': pred_mean[0, 0], 'T+5_open': pred_mean[4, 0]})
+        except Exception as e:
+            errors += 1
+            if errors <= 3:               # 只打印前 3 条，避免刷屏
+                print(f"股票 {code} 预测失败: {e}")
             continue
 
-    # 构建结果 DataFrame
     result_df = pd.DataFrame(results)
-    # 计算预期收益率
-    result_df['expected_roi'] = (result_df['T+5_open'] - result_df['T+1_open']) / result_df['T+1_open']
-    # 按收益率排序并赋予排名
-    result_df["rank"] = result_df["expected_roi"].rank(method="first", ascending=False).astype(int)
+    if not result_df.empty:
+        result_df['expected_roi'] = (result_df['T+5_open'] - result_df['T+1_open']) / result_df['T+1_open']
+        result_df['rank'] = result_df['expected_roi'].rank(method='first', ascending=False).astype(int)
+    return result_df, len(stock_codes), errors
 
-    # 保存全量预测（累积，供统一评估）
-    save_full_predictions(result_df)
 
-    # ====================== 选股开始 ======================
-    # 根据预期收益率划分三个池子
-    # 超高收益池：预期收益率大于 10%
-    pool_super_high  = result_df[result_df['expected_roi'] > 0.10].copy()
-    # 高收益池：预期收益率在 5% 到 10% 之间
-    pool_high        = result_df[(result_df['expected_roi'] >0.05) & (result_df['expected_roi'] <0.10)].copy()
-    # 负收益池：预期收益率在 -2% 到 0 之间（小幅亏损）
-    pool_neg_small   = result_df[(result_df['expected_roi'] > -0.02) & (result_df['expected_roi'] <0)].copy()
-
-    # 初始化最终选中的三只股票
-    final_super = None
-    final_high = None
-    final_neg = None
-
-    # 1. 超高收益池选股：距离池子原始均值最近1只，权重0.4
-    if len(pool_super_high) > 0:
-        # 计算池子的原始均值
-        mean_super_raw = pool_super_high['expected_roi'].mean()
-        # 计算每只股票收益率与均值的绝对距离
-        pool_super_high['abs_to_mean'] = np.abs(pool_super_high['expected_roi'] - mean_super_raw)
-        # 取距离均值最近的股票
-        final_super = pool_super_high.loc[pool_super_high['abs_to_mean'].idxmin()]
-
-    # 2. 高收益池选股：过滤后取距离过滤后均值最近1只，权重0.3
-    if len(pool_high) >0:
-        # 计算高收益池的原始均值
-        mean_high_raw = pool_high['expected_roi'].mean()
-        # 过滤：保留收益率与均值差距在 1% 以内的股票
-        pool_high_filtered = pool_high[np.abs(pool_high['expected_roi'] - mean_high_raw) <= 0.01].copy()
-        if len(pool_high_filtered) >0:
-            # 计算过滤后的均值
-            mean_high_filtered = pool_high_filtered['expected_roi'].mean()
-            # 取距离过滤后均值最近的股票
-            pool_high_filtered['abs_to_mean'] = np.abs(pool_high_filtered['expected_roi'] - mean_high_filtered)
-            final_high = pool_high_filtered.loc[pool_high_filtered['abs_to_mean'].idxmin()]
-
-    # 3. 负收益池选股：满足约束条件后取 sum_val 最接近 0 的股票，权重0.3
-    if final_super is not None and final_high is not None and len(pool_neg_small)>0:
-        # 获取超高收益和高收益池选出的股票的收益率
-        roi_super = final_super['expected_roi']
-        roi_high = final_high['expected_roi']
-        # 计算组合基准值 V
-        V = (roi_super * 0.4 + roi_high * 0.3) / 5.0
-
-        pool_neg_new = pool_neg_small.copy()
-        # 过滤：收益率的绝对值在 0.01 到 0.018 之间
-        pool_neg_new = pool_neg_new[(np.abs(pool_neg_new['expected_roi']) >=0.01) & (np.abs(pool_neg_new['expected_roi']) <=0.018)].copy()
-        # 计算 V + roi_neg
-        pool_neg_new['sum_val'] = V + pool_neg_new['expected_roi']
-        # 筛选 sum_val > 0 的候选股票
-        candidate = pool_neg_new[pool_neg_new['sum_val'] > 0].copy()
-
-        if len(candidate) >0:
-            # 按 sum_val 升序排列，取最接近 0 的股票
-            candidate = candidate.sort_values("sum_val", ascending=True).reset_index(drop=True)
-            final_neg = candidate.iloc[0]
-
-    # 组装输出结果
-    select_rows = []
-    if final_super is not None:
-        select_rows.append({"stock_id":final_super["code"], "weight":0.4})
-    if final_high is not None:
-        select_rows.append({"stock_id":final_high["code"], "weight":0.3})
-    if final_neg is not None:
-        select_rows.append({"stock_id":final_neg["code"], "weight":0.3})
-
-    # 兜底：当某池无满足条件样本，提示警告
-    if len(select_rows)!=3:
-        print("⚠️警告：部分池子没有满足筛选条件的股票，输出条目不足3条")
-
-    out_df = pd.DataFrame(select_rows)
-    # ====================== 选股逻辑结束 ======================
-
-    # 保存组合记录（累积，供统一评估）并输出竞赛格式结果
-    save_portfolio(select_rows)
+def main():
+    """主函数：数据加载 -> 逐期预测 -> 选股 -> 输出结果（三期滚动）"""
+    print(f"Kronos 推理 + 沪深300 选股流程开始（{len(END_DATES)} 期）")
+    df_all = preprocess_data()
+    predictor = load_model()
+    trade_dates = load_trade_calendar()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_df.to_csv(OUTPUT_FILE, index=False)
-    print(out_df.to_string(index=False))
+
+    for end_date in END_DATES:
+        pred_dates = next_trade_dates(trade_dates, end_date, PRED_LEN)
+        if len(pred_dates) < PRED_LEN:
+            print(f"[{end_date}] 警告：交易日历中其后不足 {PRED_LEN} 个交易日，跳过")
+            continue
+
+        result_df, n_codes, n_err = predict_cross_section(predictor, df_all, end_date, pred_dates)
+        if result_df.empty:
+            print(f"[{end_date}] 无有效预测结果（候选 {n_codes} 只，异常 {n_err} 只）")
+            continue
+        print(f"[{end_date}] 候选 {n_codes} 只，有效预测 {len(result_df)} 只，异常 {n_err} 只")
+
+        # 保存全量预测（累积，供统一评估）
+        save_full_predictions(result_df, OUTPUT_DIR, end_date)
+
+        # 选股（Top-K 等权，与其余三模型统一口径）
+        select_rows = select_portfolio(result_df)
+        if len(select_rows) < TOP_K:
+            print(f"[{end_date}] 候选不足，仅选出 {len(select_rows)} 只（上限 {TOP_K}）")
+
+        out_df = pd.DataFrame(select_rows)
+        # 保存组合记录（累积，供统一评估）并输出竞赛格式结果
+        save_portfolio(select_rows, OUTPUT_DIR, end_date)
+        period_file = os.path.join(OUTPUT_DIR, f"result_{end_date.replace('-', '')}.csv")
+        out_df.to_csv(period_file, index=False)
+        print(f"[{end_date}] 结果已保存: {period_file}")
+        print(f"\n===== 基准日 {end_date}"
+              f"（预测 {pred_dates[0].date()} ~ {pred_dates[-1].date()}）=====")
+        print(out_df.to_string(index=False) if len(out_df) else "（无满足条件的股票）")
+
+    print("Kronos 推理 + 选股流程结束")
 
 if __name__ == "__main__":
     main()

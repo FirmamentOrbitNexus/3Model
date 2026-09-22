@@ -70,6 +70,9 @@ class Config:
     use_tf32 = False
     # 模型保存目录（环境变量 MODEL_DIR 可覆盖）
     save_dir = model_dir('lgbm')
+    # 训练数据截止日（环境变量 TRAIN_END_DATE 可覆盖）
+    # 与 test.py 的首个预测基准日保持一致，避免测试期数据泄露进训练集
+    train_end_date = '2026-08-14'
     # LightGBM 参数
     params = dict(
         objective='regression',       # 回归任务
@@ -221,7 +224,8 @@ def main():
     logger.info("LightGBM 基线训练流程开始")
 
     train_start = os.environ.get('TRAIN_START_DATE', '')
-    train_end = os.environ.get('TRAIN_END_DATE', '')
+    # 默认使用配置里的截止日（环境变量优先），避免测试期数据泄露进训练集
+    train_end = os.environ.get('TRAIN_END_DATE', cfg.train_end_date)
 
     df = load_stock_dataframe()
     if train_start:

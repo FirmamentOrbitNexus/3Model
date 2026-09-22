@@ -1,10 +1,10 @@
 # ============================================================
-# test.py - LSTM 模型推理 + 沪深300 选股
-# 流程：加载模型与配置 -> 逐只股票读取最近 LOOKBACK 天数据 -> 经
+# test.py - LSTM 模型推理 + 沪深300 选股（多期滚动）
+# 流程：加载模型与配置 -> 对每个基准日：逐只股票读取最近 LOOKBACK 天数据 ->
 #       特征工程（与训练口径一致）-> 归一化 -> LSTM 预测 5 天 ->
 #       反归一化得 T+1/T+5 开盘价 -> 计算 expected_roi ->
-#       三池选股（与 Kronos test.py 口径完全一致，最多 3 只股票，
-#       满足"最多不超过 5 只"的约束）-> 输出 result.csv
+#       Top-K 等权选股（common/strategy.py，默认 K=5，只买预期上涨标的）
+#       -> 单期输出 result_<日期>.csv + 累积 result_full.csv / result_portfolio.csv
 # ============================================================
 # ========== 所有环境变量必须在 import torch 之前设置 ==========
 import os
@@ -24,9 +24,11 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.config import configure_determinism, get_device
 from common.data_io import load_stock_dataframe
-from common.featurework import compute_features, FEATURE_COLUMNS, MODEL_COLUMNS
+from common.featurework import compute_features, MODEL_COLUMNS
 from common.paths import model_dir, output_dir
-from common.strategy import select_portfolio, save_full_predictions, save_portfolio
+from common.strategy import (
+    TOP_K, select_portfolio, save_full_predictions, save_portfolio,
+)
 from train import StockLSTM
 
 # ========== import torch 之后执行统一确定性配置 ==========
@@ -179,8 +181,8 @@ def main():
         save_full_predictions(result_df, OUTPUT_DIR, end_date, logger)
 
         select_rows = select_portfolio(result_df)
-        if len(select_rows) != 3:
-            logger.warning(f"[{end_date}] 部分池子无满足筛选条件的股票，输出 {len(select_rows)} 只（约束≤5）")
+        if len(select_rows) < TOP_K:
+            logger.warning(f"[{end_date}] 候选不足，仅选出 {len(select_rows)} 只（上限 {TOP_K}）")
         save_portfolio(select_rows, OUTPUT_DIR, end_date, logger)
 
         # 单期明细（按基准日命名，便于逐期查看）
